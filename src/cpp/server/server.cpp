@@ -3520,9 +3520,14 @@ void Server::handle_load(const httplib::Request& req, httplib::Response& res) {
         LOG(INFO, "Server") << " " << options.to_log_string(false);
         LOG(INFO, "Server") << std::endl;
 
-        // Persist request options to model info if requested
+        // Persist request options to model info if requested. Merge the request over
+        // the model's PRIOR persisted options (Layer 3) only — this preserves earlier
+        // user saves without baking image_defaults / model-JSON defaults (Layers 1-2)
+        // into recipe_options.json, which would shadow future registry default changes.
         if (save_options) {
-            info.recipe_options = options;
+            RecipeOptions prior_saved = model_manager_->get_saved_model_options(
+                info, /*refresh_saved_from_disk=*/true);
+            info.recipe_options = options.inherit(prior_saved);
             model_manager_->save_model_options(info);
         }
 

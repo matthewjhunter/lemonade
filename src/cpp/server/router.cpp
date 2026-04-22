@@ -353,14 +353,24 @@ void Router::load_model(const std::string& model_name,
     const std::string canonical_model_name = resolve_model_name(model_name);
     const std::string backend_option = model_info.recipe + "_backend";
 
-    RecipeOptions tentative = options.inherit(model_info.recipe_options.inherit(
+    // Re-read persisted per-model options from disk so an updated
+    // recipe_options.json is honored on this load without a server restart.
+    RecipeOptions current_model_options = model_manager_->get_effective_recipe_options(
+        model_info, /*refresh_saved_from_disk=*/true);
+
+    // First pass: resolve which backend, from request + refreshed persisted +
+    // backend-agnostic global defaults.
+    RecipeOptions tentative = options.inherit(current_model_options.inherit(
     RecipeOptions(model_info.recipe, config_->recipe_options(""))));
     json backend_json = tentative.get_option(backend_option);
     const std::string backend = backend_json.is_string() ? backend_json.get<std::string>() : "";
 
-    // Second pass: rebuild defaults using the resolved backend
+    // Second pass: rebuild defaults using the resolved backend.
     RecipeOptions default_opt = RecipeOptions(model_info.recipe, config_->recipe_options(backend));
-    RecipeOptions effective_options = options.inherit(model_info.recipe_options.inherit(default_opt));
+
+    // Resolve settings: load overrides take precedence over persisted per-model
+    // options, which take precedence over runtime defaults.
+    RecipeOptions effective_options = options.inherit(current_model_options.inherit(default_opt));
 
     // LOAD SERIALIZATION STRATEGY (from spec: point #2 in Additional Considerations)
     std::unique_lock<std::mutex> lock(load_mutex_);

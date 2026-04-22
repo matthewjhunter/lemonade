@@ -20,6 +20,7 @@ Usage:
     python server_endpoints.py
 """
 
+import contextlib
 import json
 import os
 import platform
@@ -49,6 +50,7 @@ from utils.test_models import (
     USER_MODEL_VAE_CHECKPOINT,
     get_hf_cache_dir,
     get_hf_cache_dir_candidates,
+    get_lemonade_cache_dir,
 )
 
 
@@ -108,6 +110,84 @@ class EndpointTests(ServerTestBase):
                 samples.setdefault(sample.name, []).append(sample.labels)
 
         return samples
+
+    def _get_model_info(self, model_name):
+        response = requests.get(
+            f"{self.base_url}/models/{model_name}",
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def _delete_model_if_present(self, model_name):
+        response = requests.post(
+            f"{self.base_url}/delete",
+            json={"model_name": model_name},
+            timeout=TIMEOUT_DEFAULT,
+        )
+        self.assertIn(response.status_code, [200, 422])
+
+    def _pull_temp_llamacpp_alias(self, model_name, recipe_options=None):
+        base_model = self._get_model_info(ENDPOINT_TEST_MODEL)
+        payload = {
+            "model_name": model_name,
+            "checkpoint": base_model["checkpoint"],
+            "recipe": base_model["recipe"],
+        }
+        if recipe_options is not None:
+            payload["recipe_options"] = recipe_options
+
+        response = requests.post(
+            f"{self.base_url}/pull",
+            json=payload,
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+        self.assertEqual(response.status_code, 200)
+
+    @contextlib.contextmanager
+    def _preserve_builtin_recipe_options(self):
+        """Snapshot the shared built-in test model's saved recipe_options.json entry
+        and restore it (or remove it if it did not exist) on exit. Tests that save
+        options for the built-in (a model used across the suite) must not leak
+        persisted state into later tests. Best-effort: if the cache dir is not
+        writable by the test process, restore is skipped.
+        """
+        path = os.path.join(get_lemonade_cache_dir(), "recipe_options.json")
+
+        def _read():
+            if os.path.isfile(path):
+                with open(path, encoding="utf-8") as f:
+                    return json.load(f)
+            return {}
+
+        def _find_key(options):
+            return next(
+                (
+                    k
+                    for k in options
+                    if k == ENDPOINT_TEST_MODEL or k.endswith(f".{ENDPOINT_TEST_MODEL}")
+                ),
+                None,
+            )
+
+        pre = _read()
+        pre_key = _find_key(pre)
+        pre_entry = json.dumps(pre[pre_key]) if pre_key is not None else None
+        try:
+            yield
+        finally:
+            current = _read()
+            key = _find_key(current) or pre_key
+            if key is not None:
+                if pre_entry is not None:
+                    current[key] = json.loads(pre_entry)
+                else:
+                    current.pop(key, None)
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(current, f, indent=2)
+                except OSError:
+                    pass  # best-effort cleanup; cache not writable by this process
 
     def test_000_endpoints_registered(self):
         """Verify all expected endpoints are registered on both v0 and v1."""
@@ -1306,6 +1386,287 @@ class EndpointTests(ServerTestBase):
                 timeout=TIMEOUT_DEFAULT,
             )
         print("[OK] Cloud refresh is idempotent — re-auth produces no duplicates")
+
+    def test_012l_autoload_uses_saved_options(self):
+        """Test that inference-triggered auto-load recalls saved per-model options."""
+        custom_ctx_size = 3584
+        with self._preserve_builtin_recipe_options():
+            response = requests.post(
+                f"{self.base_url}/load",
+                json={
+                    "model_name": ENDPOINT_TEST_MODEL,
+                    "ctx_size": custom_ctx_size,
+                    "save_options": True,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(response.status_code, 200)
+
+            requests.post(
+                f"{self.base_url}/unload",
+                json={"model_name": ENDPOINT_TEST_MODEL},
+                timeout=TIMEOUT_DEFAULT,
+            )
+
+            inference_response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json={
+                    "model": ENDPOINT_TEST_MODEL,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 5,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(inference_response.status_code, 200)
+
+            health = requests.get(
+                f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT
+            ).json()
+            loaded = next(
+                (
+                    m
+                    for m in health.get("all_models_loaded", [])
+                    if m["model_name"] == ENDPOINT_TEST_MODEL
+                ),
+                None,
+            )
+            self.assertIsNotNone(
+                loaded, f"Model {ENDPOINT_TEST_MODEL} should be loaded"
+            )
+            self.assertEqual(
+                loaded.get("recipe_options", {}).get("ctx_size"),
+                custom_ctx_size,
+                "Auto-load should recall saved ctx_size from recipe_options.json",
+            )
+
+            print(f"[OK] Auto-load recalled saved ctx_size={custom_ctx_size}")
+
+    def test_012m_user_alias_autoload_preserves_baked_llamacpp_args(self):
+        """Test that save_options preserves existing user alias llama.cpp args."""
+        model_name = f"user.Load-Merge-Regression-{uuid.uuid4().hex[:8]}"
+        baked_args = "--repeat-penalty 1.0 --top-k 20"
+        custom_ctx_size = 3072
+
+        try:
+            self._pull_temp_llamacpp_alias(
+                model_name,
+                recipe_options={"llamacpp_args": baked_args},
+            )
+
+            response = requests.post(
+                f"{self.base_url}/load",
+                json={
+                    "model_name": model_name,
+                    "ctx_size": custom_ctx_size,
+                    "save_options": True,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(response.status_code, 200)
+
+            requests.post(
+                f"{self.base_url}/unload",
+                json={"model_name": model_name},
+                timeout=TIMEOUT_DEFAULT,
+            )
+
+            inference_response = requests.post(
+                f"{self.base_url}/chat/completions",
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 5,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(inference_response.status_code, 200)
+
+            model_data = self._get_model_info(model_name)
+            recipe_options = model_data.get("recipe_options", {})
+            self.assertEqual(recipe_options.get("ctx_size"), custom_ctx_size)
+            self.assertEqual(recipe_options.get("llamacpp_args"), baked_args)
+
+            # /health reports user models in all_models_loaded WITHOUT the "user."
+            # prefix, while /models and /load use the prefixed id — match either form.
+            health = requests.get(
+                f"{self.base_url}/health", timeout=TIMEOUT_DEFAULT
+            ).json()
+            expected_names = {model_name, model_name.removeprefix("user.")}
+            loaded = next(
+                (
+                    m
+                    for m in health.get("all_models_loaded", [])
+                    if m["model_name"] in expected_names
+                ),
+                None,
+            )
+            self.assertIsNotNone(loaded, f"Model {model_name} should be loaded")
+            self.assertEqual(
+                loaded.get("recipe_options", {}).get("ctx_size"),
+                custom_ctx_size,
+            )
+            # The loaded model's effective llamacpp_args may also include backend
+            # defaults from config.json (e.g. --host/--no-mmap/-ctk), so assert the
+            # baked args are PRESENT, not exactly equal. (The exact saved value is
+            # checked above via /models, which returns the saved Layer-3 options.)
+            self.assertIn(
+                baked_args,
+                loaded.get("recipe_options", {}).get("llamacpp_args", ""),
+            )
+
+            print(
+                f"[OK] User alias auto-load preserved ctx_size={custom_ctx_size} "
+                f"and baked llamacpp_args"
+            )
+        finally:
+            self._delete_model_if_present(model_name)
+
+    def test_012n_user_model_delete_clears_saved_options(self):
+        """Test deleting a user model removes its persisted recipe options."""
+        model_name = f"user.Delete-Recreate-Regression-{uuid.uuid4().hex[:8]}"
+        custom_ctx_size = 3328
+
+        try:
+            self._pull_temp_llamacpp_alias(model_name)
+
+            response = requests.post(
+                f"{self.base_url}/load",
+                json={
+                    "model_name": model_name,
+                    "ctx_size": custom_ctx_size,
+                    "save_options": True,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(response.status_code, 200)
+
+            model_data = self._get_model_info(model_name)
+            self.assertEqual(
+                model_data.get("recipe_options", {}).get("ctx_size"),
+                custom_ctx_size,
+            )
+
+            delete_response = requests.post(
+                f"{self.base_url}/delete",
+                json={"model_name": model_name},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(delete_response.status_code, 200)
+
+            self._pull_temp_llamacpp_alias(model_name)
+
+            recreated_model_data = self._get_model_info(model_name)
+            self.assertNotIn(
+                "ctx_size",
+                recreated_model_data.get("recipe_options", {}),
+                "Recreated user model should not inherit deleted saved ctx_size",
+            )
+
+            print("[OK] Deleting a user model cleared its saved recipe options")
+        finally:
+            self._delete_model_if_present(model_name)
+
+    def test_012o_load_uses_updated_recipe_options_file_without_restart(self):
+        """An external edit to recipe_options.json is honored on the next load
+        without restarting lemond — the core of this PR.
+
+        Distinct from the save/auto-load recall tests: those leave the in-memory
+        snapshot already holding the saved value, so they pass even without the
+        disk refresh. Here the on-disk value is changed out-of-band, so only a
+        load-time re-read of recipe_options.json picks it up. (Salvaged from the
+        removed server_env_vars.py TestRecipeOptionsReloadFromDisk.)
+        """
+        cache_dir = get_lemonade_cache_dir()
+        recipe_options_path = os.path.join(cache_dir, "recipe_options.json")
+
+        # Resolve writability preconditions BEFORE the mutating save-bearing /load,
+        # so a skip never leaves the model loaded / the saved entry mutated. The
+        # file itself is created by the save below; we only need the cache dir to
+        # exist and be writable here.
+        if not os.path.isdir(cache_dir):
+            self.skipTest(f"lemonade cache dir not found at {cache_dir}")
+        if not os.access(cache_dir, os.W_OK):
+            self.skipTest(f"lemonade cache dir not writable at {cache_dir}")
+
+        # Re-pull defensively: earlier tests create+delete user aliases on this
+        # built-in's checkpoint, which can remove the shared blob on some cache
+        # layouts — keep this test order-independent.
+        requests.post(
+            f"{self.base_url}/pull",
+            json={"model_name": ENDPOINT_TEST_MODEL},
+            timeout=TIMEOUT_MODEL_OPERATION,
+        )
+
+        original_ctx = 2048
+        updated_ctx = 3072
+
+        # _preserve_builtin_recipe_options restores (or removes) the built-in's
+        # saved entry on exit so this test does not leak persisted state.
+        with self._preserve_builtin_recipe_options():
+            # Save baseline per-model options to disk via the API.
+            save_response = requests.post(
+                f"{self.base_url}/load",
+                json={
+                    "model_name": ENDPOINT_TEST_MODEL,
+                    "ctx_size": original_ctx,
+                    "save_options": True,
+                },
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(save_response.status_code, 200)
+
+            self.assertTrue(
+                os.path.isfile(recipe_options_path),
+                f"save_options=true should have written {recipe_options_path}",
+            )
+
+            with open(recipe_options_path, encoding="utf-8") as f:
+                recipe_options = json.load(f)
+
+            # Saved entry is keyed by canonical ID (built-ins as builtin.<name>).
+            key = next(
+                (
+                    k
+                    for k in recipe_options
+                    if k == ENDPOINT_TEST_MODEL or k.endswith(f".{ENDPOINT_TEST_MODEL}")
+                ),
+                None,
+            )
+            self.assertIsNotNone(
+                key, f"{ENDPOINT_TEST_MODEL} not present in {recipe_options_path}"
+            )
+
+            # Edit the on-disk value out-of-band (no API), then reload with no
+            # ctx_size in the request and without restarting the server.
+            recipe_options[key]["ctx_size"] = updated_ctx
+            with open(recipe_options_path, "w", encoding="utf-8") as f:
+                json.dump(recipe_options, f, indent=2)
+
+            unload_response = requests.post(
+                f"{self.base_url}/unload",
+                json={"model_name": ENDPOINT_TEST_MODEL},
+                timeout=TIMEOUT_DEFAULT,
+            )
+            self.assertEqual(unload_response.status_code, 200)
+
+            load_response = requests.post(
+                f"{self.base_url}/load",
+                json={"model_name": ENDPOINT_TEST_MODEL},
+                timeout=TIMEOUT_MODEL_OPERATION,
+            )
+            self.assertEqual(load_response.status_code, 200)
+
+            loaded = self._get_loaded_model_info(ENDPOINT_TEST_MODEL)
+            self.assertIsNotNone(loaded, f"{ENDPOINT_TEST_MODEL} should be loaded")
+            self.assertEqual(
+                loaded.get("recipe_options", {}).get("ctx_size"),
+                updated_ctx,
+                "Load should honor updated recipe_options.json without restart",
+            )
+            print(
+                f"[OK] On-disk recipe_options.json edit honored without restart "
+                f"(ctx_size {original_ctx} -> {updated_ctx})"
+            )
 
     def test_013_unload_specific_model(self):
         """Test unloading a specific model by name."""

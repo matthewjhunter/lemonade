@@ -103,6 +103,31 @@ def get_default_hf_cache_dir():
     return os.path.join(home, ".cache", "huggingface", "hub")
 
 
+def get_lemonade_cache_dir():
+    """Resolve the lemonade cache dir (home of recipe_options.json) for on-disk
+    assertions. Mirrors path_utils.cpp get_cache_dir():
+      1. LEMONADE_CACHE_DIR env var (direct path)
+      2. Platform default cache dir
+
+    On-disk recipe-option tests skip when this can't be located or written, so an
+    imperfect default fallback degrades to a skip rather than a false failure.
+    """
+    env_cache = os.environ.get("LEMONADE_CACHE_DIR", "")
+    if env_cache:
+        return env_cache
+    if platform.system() == "Windows":
+        # Match the server default in path_windows.cpp: USERPROFILE\.cache\lemonade
+        # (NOT %LOCALAPPDATA%), so the on-disk regression inspects the same dir lemond
+        # writes. A server started with a positional cache_dir still won't match here —
+        # set LEMONADE_CACHE_DIR for that case (the test skips rather than misfire).
+        userprofile = os.environ.get("USERPROFILE", "C:\\")
+        return os.path.join(userprofile, ".cache", "lemonade")
+    home = os.environ.get("HOME")
+    if not home:
+        raise RuntimeError("HOME is not set; cannot resolve lemonade cache directory")
+    return os.path.join(home, ".cache", "lemonade")
+
+
 def get_hf_cache_dir_candidates():
     """Return likely HF cache roots for on-disk assertions.
 

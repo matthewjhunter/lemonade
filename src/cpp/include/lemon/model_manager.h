@@ -226,6 +226,15 @@ public:
     // removed in the directory.
     void set_extra_models_dir(const std::string& dir);
 
+    // Resolve current per-model recipe options using model defaults plus persisted overrides.
+    RecipeOptions get_effective_recipe_options(const ModelInfo& info,
+                                              bool refresh_saved_from_disk = false);
+
+    // Return ONLY this model's persisted Layer-3 saved options (recipe_options.json),
+    // not the fully-resolved stack — for merge-preserving saves that do not bake defaults.
+    RecipeOptions get_saved_model_options(const ModelInfo& info,
+                                          bool refresh_saved_from_disk = false);
+
     void save_model_options(const ModelInfo& info);
 
     void start_directory_watcher();
@@ -304,6 +313,10 @@ private:
 
     // Discover GGUF models from extra_models_dir
     std::map<std::string, ModelInfo> discover_extra_models() const;
+    json get_saved_recipe_options_snapshot(bool refresh_saved_from_disk);
+    RecipeOptions resolve_effective_recipe_options(const ModelInfo& info,
+                                                   const json& saved_recipe_options) const;
+    void delete_saved_model_options(const std::string& model_name);
 
     json server_models_;
     json user_models_;
