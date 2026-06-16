@@ -1701,3 +1701,23 @@ if(EXISTS "${_DIR_WATCHER_TEST_SRC}" AND EXISTS "${_DIR_WATCHER_LIB_SRC}")
     include(CTest)
     add_test(NAME DirectoryWatcherTest COMMAND test_directory_watcher)
 endif()
+
+# Pure version-resolution policy test (lemon::resolve_latest_pin). Header-only
+# logic, so the test links nothing beyond the standard library — regression
+# coverage for #2265 (fall back to the installed binary when the GitHub
+# "latest" lookup fails).
+set(_LATEST_FALLBACK_TEST_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_latest_version_fallback.cpp"
+)
+if(EXISTS "${_LATEST_FALLBACK_TEST_SRC}")
+    add_executable(test_latest_version_fallback
+        test/cpp/test_latest_version_fallback.cpp
+    )
+    target_include_directories(test_latest_version_fallback PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
+        ${CMAKE_CURRENT_BINARY_DIR}/include
+    )
+
+    include(CTest)
+    add_test(NAME LatestVersionFallbackTest COMMAND test_latest_version_fallback)
+endif()
